@@ -23,12 +23,17 @@
 #    --acl-target USER        User to apply ACL rule to
 #    --acl-perms rwx          ACL permission string (e.g. rwx, r-x, ---)
 #    --acl-action allow|deny  Allow or deny access (default: allow)
+#    --allow-cd               Allow cd inside the workspace directory
+#    -w, --workspace PATH     Workspace path for --allow-cd (default: ~/workspace)
 #    --harden                 Apply extra hardening (immutable profile, etc.)
 #    --help                   Show this help message
 #
 #  Examples:
 #    sudo ./restricted-user-manager.sh --mode restricted-user -u kiosk \
-#         -a firefox,vlc --harden
+#         -a firefox,vlc --harden --allow-cd
+#
+#    sudo ./restricted-user-manager.sh --mode restricted-user -u kiosk \
+#         -a firefox,vlc --allow-cd -w /srv/projects/kiosk
 #
 #    sudo ./restricted-user-manager.sh --mode isolate-folder \
 #         -f /srv/private --owner admin:admin --perms 750
@@ -112,6 +117,7 @@ do_restricted_user() {
   local homedir="$3"
   local apps_csv="$4"
   local harden="$5"
+  local allow_cd="$6"
 
   header "Creating Restricted User: $username"
 
@@ -157,12 +163,26 @@ do_restricted_user() {
     if resolved=$(resolve_cmd "$app"); then
       ln -sf "$resolved" "$bindir/$app"
       success "  Linked: $app -> $resolved"
-      ((linked++))
+      linked=$((linked + 1))
     fi
   done
 
   if [[ $linked -eq 0 ]]; then
     warn "No valid commands were linked. The user won't be able to run anything."
+  fi
+
+  # ── Allow-cd: resolve path and create workspace ────────────────────────
+  local cd_path=""
+  if [[ -n "$allow_cd" ]]; then
+    if [[ "$allow_cd" == "auto" ]]; then
+      cd_path="$homedir/workspace"
+    else
+      cd_path="$allow_cd"
+    fi
+    mkdir -p "$cd_path"
+    chown "$username:$username" "$cd_path"
+    chmod 750 "$cd_path"
+    success "Workspace created: $cd_path"
   fi
 
   # ── Lock down PATH via .bash_profile ─────────────────────────────────────
@@ -174,6 +194,34 @@ export PATH="$HOME/bin"
 enable -n source
 enable -n .
 PROFILEEOF
+
+  # Inject cd wrapper if --allow-cd was set
+  if [[ -n "$cd_path" ]]; then
+    cat >>"$profile" <<CDEOF
+
+# Restricted cd — only allows navigation inside: $cd_path
+ALLOWED_CD_PATH="$cd_path"
+cd() {
+    local target="\${1:-\$ALLOWED_CD_PATH}"
+    local resolved
+    resolved=\$(realpath -m "\$target" 2>/dev/null)
+    if [ -z "\$resolved" ]; then
+        echo "cd: cannot resolve path: \$target"
+        return 1
+    fi
+    if [ "\$resolved" = "\$ALLOWED_CD_PATH" ] || case "\$resolved" in "\$ALLOWED_CD_PATH"/*) true;; *) false;; esac; then
+        builtin cd "\$target"
+    else
+        echo "cd: restricted — you can only navigate inside \$ALLOWED_CD_PATH"
+        return 1
+    fi
+}
+export -f cd
+# Start inside the workspace
+builtin cd "$cd_path"
+CDEOF
+    success "Restricted cd enabled — locked to $cd_path"
+  fi
 
   # Also set .bashrc to source .bash_profile if interactive
   local bashrc="$homedir/.bashrc"
@@ -226,6 +274,11 @@ RCEOF
   echo -e "  ${BOLD}Home:${RESET}        $homedir"
   echo -e "  ${BOLD}Allowed:${RESET}     $apps_csv"
   echo -e "  ${BOLD}Hardened:${RESET}    $harden"
+  if [[ -n "$cd_path" ]]; then
+    echo -e "  ${BOLD}Allow cd:${RESET}    $cd_path"
+  else
+    echo -e "  ${BOLD}Allow cd:${RESET}    no (cd fully blocked)"
+  fi
   echo
   success "Done! Test with:  su - $username"
 }
@@ -414,18 +467,40 @@ interactive_mode() {
     fi
 
     echo
+    local i_allow_cd=""
+    if confirm "Allow cd navigation inside a specific folder?"; then
+      local default_ws="${i_homedir:-/home/$i_username}/workspace"
+      prompt "Folder path (leave empty for $default_ws): "
+      read -r i_cd_path
+      if [[ -z "$i_cd_path" ]]; then
+        i_allow_cd="auto"
+      else
+        i_allow_cd="$i_cd_path"
+      fi
+    fi
+
+    echo
     header "Review Configuration"
     echo -e "  Username:   $i_username"
     echo -e "  Home:       ${i_homedir:-/home/$i_username}"
     echo -e "  Apps:       $i_apps"
     echo -e "  Hardened:   $i_harden"
+    if [[ -n "$i_allow_cd" ]]; then
+      if [[ "$i_allow_cd" == "auto" ]]; then
+        echo -e "  Allow cd:   ${i_homedir:-/home/$i_username}/workspace (auto)"
+      else
+        echo -e "  Allow cd:   $i_allow_cd"
+      fi
+    else
+      echo -e "  Allow cd:   no"
+    fi
     echo
     confirm "Proceed?" || {
       info "Aborted."
       exit 0
     }
 
-    do_restricted_user "$i_username" "$i_password" "$i_homedir" "$i_apps" "$i_harden"
+    do_restricted_user "$i_username" "$i_password" "$i_homedir" "$i_apps" "$i_harden" "$i_allow_cd"
     ;;
 
   2)
@@ -532,6 +607,8 @@ ACL_TARGET=""
 ACL_PERMS="rwx"
 ACL_ACTION="allow"
 HARDEN="no"
+ALLOW_CD=""
+WORKSPACE=""
 CLI_MODE=false
 
 while [[ $# -gt 0 ]]; do
@@ -586,6 +663,15 @@ while [[ $# -gt 0 ]]; do
     HARDEN="yes"
     shift
     ;;
+  --allow-cd)
+    ALLOW_CD="yes"
+    shift
+    ;;
+  -w | --workspace)
+    WORKSPACE="$2"
+    ALLOW_CD="yes"
+    shift 2
+    ;;
   *)
     error "Unknown option: $1"
     echo "Use --help for usage information."
@@ -623,7 +709,17 @@ else
       }
     fi
 
-    do_restricted_user "$USERNAME" "$PASSWORD" "$HOMEDIR" "$APPS" "$HARDEN"
+    # Resolve allow-cd workspace value
+    resolved_cd=""
+    if [[ "$ALLOW_CD" == "yes" ]]; then
+      if [[ -n "$WORKSPACE" ]]; then
+        resolved_cd="$WORKSPACE"
+      else
+        resolved_cd="auto"
+      fi
+    fi
+
+    do_restricted_user "$USERNAME" "$PASSWORD" "$HOMEDIR" "$APPS" "$HARDEN" "$resolved_cd"
     ;;
 
   isolate-folder)

@@ -97,11 +97,12 @@ Creates a new Linux user (or reconfigures an existing one) with a **restricted B
 3. Symlinks only the commands you allow into `~/bin`.
 4. Writes a locked `.bash_profile` that sets `PATH="$HOME/bin"` and nothing else.
 5. Sets ownership so the user cannot modify their own profile.
+6. *(Optional)* Creates a workspace folder and injects a restricted `cd` wrapper that only allows navigation inside it.
 
 **What the restricted user *cannot* do:**
 
 - Change their `PATH`
-- Use `cd` to navigate the filesystem
+- Use `cd` to navigate the filesystem *(unless `--allow-cd` is set, in which case `cd` is limited to a single directory)*
 - Redirect output with `>` or `>>`
 - Run commands with `/` in the name (no `/usr/bin/something`)
 - Modify their `.bash_profile` or `.bashrc`
@@ -112,6 +113,7 @@ Creates a new Linux user (or reconfigures an existing one) with a **restricted B
 - Run the specific commands you whitelisted
 - Read files their permissions allow
 - Work within their home directory
+- Navigate inside a designated workspace folder (if `--allow-cd` was used)
 
 #### CLI Usage
 
@@ -122,6 +124,8 @@ sudo ./restricted-user-manager.sh \
   -a APP1,APP2,APP3 \
   [-p PASSWORD] \
   [-h /custom/home/path] \
+  [--allow-cd] \
+  [-w /workspace/path] \
   [--harden]
 ```
 
@@ -131,6 +135,8 @@ sudo ./restricted-user-manager.sh \
 | `-a, --apps` | Yes | Comma-separated list of allowed commands |
 | `-p, --password` | No | Password (securely prompted if omitted) |
 | `-h, --home` | No | Custom home directory (default: `/home/USERNAME`) |
+| `--allow-cd` | No | Enable restricted `cd` inside a workspace directory |
+| `-w, --workspace` | No | Custom workspace path (default: `~/workspace`). Implies `--allow-cd` |
 | `--harden` | No | Apply extra security hardening |
 
 ---
@@ -228,6 +234,8 @@ Restricted user options:
   -p, --password PASS  Password (prompted if omitted)
   -h, --home PATH      Custom home directory
   -a, --apps CMD,CMD   Comma-separated allowed commands
+  --allow-cd           Allow cd inside the workspace directory
+  -w, --workspace PATH Workspace path for --allow-cd (default: ~/workspace)
   --harden             Enable extra hardening
 
 Folder isolation options:
@@ -271,6 +279,8 @@ The script then walks you through every option with prompts, shows a review summ
 
 Passwords are entered with hidden input and require confirmation (typed twice).
 
+In Restricted User mode, the script will also ask whether you want to allow `cd` navigation inside a specific folder. If you say yes but leave the path empty, it defaults to a `workspace` directory inside the user's home folder.
+
 ---
 
 ## Examples
@@ -283,6 +293,28 @@ sudo ./restricted-user-manager.sh \
   -u kiosk \
   -a firefox \
   --harden
+```
+
+### Create a kiosk user with a workspace they can navigate
+
+```bash
+# Auto-creates ~/workspace and allows cd only inside it
+sudo ./restricted-user-manager.sh \
+  --mode restricted-user \
+  -u kiosk \
+  -a firefox,ls,cat \
+  --allow-cd
+```
+
+### Create a data operator with cd access to a specific project
+
+```bash
+sudo ./restricted-user-manager.sh \
+  --mode restricted-user \
+  -u operator \
+  -a ls,cat,less,grep,nano \
+  -h /opt/operator \
+  --allow-cd -w /srv/data/reports
 ```
 
 ### Create a data operator with access to a few CLI tools
@@ -329,14 +361,15 @@ sudo ./restricted-user-manager.sh \
 ### Combine modes — create a user then lock them into one folder
 
 ```bash
-# Step 1: Create the restricted user
+# Step 1: Create the restricted user with a workspace
 sudo ./restricted-user-manager.sh \
   --mode restricted-user \
   -u contractor \
   -a nano,ls,cat \
+  --allow-cd -w /srv/project-x \
   --harden
 
-# Step 2: Give them access to only one project folder via ACL
+# Step 2: Optionally grant broader read access via ACL
 sudo ./restricted-user-manager.sh \
   --mode acl \
   -f /srv/project-x \
@@ -368,6 +401,37 @@ sudo ./restricted-user-manager.sh \
 - Cannot add/remove shell builtins with `enable`
 
 By combining `rbash` with a `PATH` that only contains symlinks to approved commands, the user is effectively jailed to those commands.
+
+### Restricted cd (`--allow-cd`)
+
+By default, `rbash` completely disables `cd`. The `--allow-cd` option brings it back in a controlled way by injecting a shell function that overrides `cd` in the user's `.bash_profile`.
+
+**How it works:**
+
+1. A `cd()` function is defined that intercepts every `cd` call.
+2. The target path is resolved to an absolute path using `realpath`.
+3. The resolved path is checked against the allowed directory — if it matches or is a subdirectory, `builtin cd` is called; otherwise, access is denied.
+4. The user's shell starts inside the workspace automatically on login.
+
+**Flag combinations:**
+
+| Flags | Workspace path | Created automatically? |
+|-------|---------------|----------------------|
+| `--allow-cd` | `~/workspace` | Yes |
+| `--allow-cd -w /custom/path` | `/custom/path` | Yes |
+| `-w /custom/path` (implies `--allow-cd`) | `/custom/path` | Yes |
+
+The workspace directory is owned by the restricted user with `750` permissions, so they can read, write, and create subdirectories inside it — but `cd` outside of it is blocked.
+
+**What the user experiences:**
+
+```
+kiosk@server:~/workspace$ cd subdir/
+kiosk@server:~/workspace/subdir$ cd /etc
+cd: restricted — you can only navigate inside /home/kiosk/workspace
+kiosk@server:~/workspace/subdir$ cd ..
+kiosk@server:~/workspace$
+```
 
 ### POSIX ACLs
 
@@ -406,6 +470,12 @@ Some shell builtins (like `echo`, `printf`, `type`) are available in rbash regar
 
 **"User already exists" warning:**
 The script can reconfigure existing users. It will change their shell to rbash and rebuild their `~/bin`. Confirm when prompted.
+
+**cd says "restricted" even for paths inside the workspace:**
+Make sure you're not using symlinks that resolve outside the allowed path. The `cd` wrapper uses `realpath` to resolve the true location — if a symlink inside `~/workspace` points to `/etc`, the resolved path won't match and access will be denied (this is intentional).
+
+**cd works but --allow-cd wasn't set:**
+Some terminal emulators or login managers may source different profile files. Ensure the user logs in via `su - username` or a standard SSH session so that `.bash_profile` is loaded.
 
 ---
 
